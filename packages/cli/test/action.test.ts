@@ -3,18 +3,20 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AuditService,
   parseAuditConfig,
   type AuditRepository,
   type AuditState,
   type RunOutcome,
 } from "@heyo-sh/code-audit-core";
+import { NO_TRACER } from "@heyo-sh/code-audit-runtime-pi";
 import {
   createAuditService,
   createGitHubReviewProgress,
   createSnapshotResolver,
+  createTracer,
   eventPayload,
   runAction,
+  withTraceFlush,
   type ActionDependencies,
   type AuditContext,
   type PullRequestEvent,
@@ -77,6 +79,7 @@ let event: PullRequestEvent = {
 };
 let nextOutcome: RunOutcome = { kind: "published", report, state };
 let createdContext: AuditContext | undefined;
+let createdConfig: { summaryComment: boolean } | undefined;
 
 const dependencies: ActionDependencies = {
   core: {
@@ -87,8 +90,9 @@ const dependencies: ActionDependencies = {
     setFailed: (message) => messages.failures.push(message),
   },
   readEvent: async () => event,
-  createAudit: (_config, context) => {
+  createAudit: (config, context) => {
     createdContext = context;
+    createdConfig = config;
     return { run: async () => nextOutcome };
   },
 };
@@ -117,6 +121,8 @@ afterEach(async () => {
     "max-pr-commits": "100",
     "max-new-commits": "20",
   });
+  delete inputs["langfuse-public-key"];
+  delete inputs["langfuse-secret-key"];
   messages.warnings.splice(0);
   messages.information.splice(0);
   messages.failures.splice(0);
@@ -319,6 +325,15 @@ describe("GitHub Action entry point", () => {
     expect(progressCalls).toEqual(["start", "finish:false"]);
   });
 
+  test("passes the summary-comment input to the audit configuration", async () => {
+    await runAction(environment, dependencies);
+    expect(createdConfig?.summaryComment).toBe(true);
+    inputs["summary-comment"] = "false";
+    await runAction(environment, dependencies);
+    expect(createdConfig?.summaryComment).toBe(false);
+    delete inputs["summary-comment"];
+  });
+
   test("fails the job for verified findings", async () => {
     nextOutcome = {
       kind: "published",
@@ -344,16 +359,20 @@ test("builds the production service and pins Pi snapshots to the workspace", asy
     prNumber: 7,
     workspace: undefined,
   };
-  expect(createAuditService(config, context)).toBeInstanceOf(AuditService);
+  expect(createAuditService(config, context).run).toBeInstanceOf(Function);
   expect(createGitHubReviewProgress(config, context)).toBeDefined();
 
   let snapshotRequest: string[] | undefined;
+  let snapshotCalls = 0;
   const repository = {
     getSnapshot: async (
       requestedBase: string,
       requestedHead: string,
       paths: string[],
     ) => {
+      snapshotCalls += 1;
+      if (requestedBase === "f".repeat(40) && snapshotCalls < 4)
+        throw new Error("git failed");
       snapshotRequest = [requestedBase, requestedHead, ...paths];
       return {
         repositoryPath: "/workspace",
@@ -367,9 +386,80 @@ test("builds the production service and pins Pi snapshots to the workspace", asy
     },
   } as unknown as AuditRepository;
   const resolver = createSnapshotResolver(repository, ["src/**"], "/workspace");
-  await resolver.resolve("/workspace", baseSha, headSha);
+  const first = await resolver.resolve("/workspace", baseSha, headSha);
   expect(snapshotRequest).toEqual([baseSha, headSha, "src/**"]);
+  // Parallel sessions of one range share a single snapshot.
+  expect(await resolver.resolve("/workspace", baseSha, headSha)).toBe(first);
+  expect(snapshotCalls).toBe(1);
+  // A failed resolution is retried rather than cached.
+  await expect(
+    resolver.resolve("/workspace", "f".repeat(40), headSha),
+  ).rejects.toThrow("git failed");
+  await expect(
+    resolver.resolve("/workspace", "f".repeat(40), headSha),
+  ).rejects.toThrow("git failed");
+  await expect(
+    resolver.resolve("/workspace", "f".repeat(40), headSha),
+  ).resolves.toBeDefined();
   await expect(resolver.resolve("/other", baseSha, headSha)).rejects.toThrow(
     "did not match",
   );
+});
+
+test("traces in Langfuse only when its keys are configured, and flushes after every run", async () => {
+  const context = {
+    owner: "heyo",
+    repo: "audit",
+    prNumber: 7,
+    workspace: undefined,
+  };
+  const base = {
+    model: "gpt-5.6-terra",
+    "auth-type": "api-key",
+    "auth-token": "provider-key",
+    "github-token": "github-token",
+  };
+  expect(createTracer(parseAuditConfig(base), context)).toBe(NO_TRACER);
+  const traced = parseAuditConfig({
+    ...base,
+    "langfuse-public-key": "pk-lf-public",
+    "langfuse-secret-key": "sk-lf-secret",
+  });
+  expect(createTracer(traced, context)).not.toBe(NO_TRACER);
+
+  let flushes = 0;
+  const tracer = {
+    startSession: NO_TRACER.startSession,
+    flush: async () => {
+      flushes += 1;
+    },
+  };
+  const published: RunOutcome = { kind: "published", report, state };
+  await expect(
+    withTraceFlush({ run: async () => published }, tracer).run(traced),
+  ).resolves.toBe(published);
+  await expect(
+    withTraceFlush(
+      {
+        run: async () => {
+          throw new Error("audit failed");
+        },
+      },
+      tracer,
+    ).run(traced),
+  ).rejects.toThrow("audit failed");
+  expect(flushes).toBe(2);
+});
+
+test("redacts the Langfuse secret key from failure details", async () => {
+  inputs["langfuse-public-key"] = "pk-lf-public";
+  inputs["langfuse-secret-key"] = "sk-lf-secret-key";
+  nextOutcome = {
+    kind: "errored",
+    report: { ...report, conclusion: "failure", summary: "Heyo failed." },
+    error: new Error("Langfuse rejected sk-lf-secret-key"),
+  };
+  await runAction(environment, dependencies);
+  expect(messages.failures.at(-1)).toContain("[REDACTED_SECRET]");
+  expect(messages.failures.at(-1)).not.toContain("sk-lf-secret-key");
 });

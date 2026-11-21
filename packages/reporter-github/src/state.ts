@@ -1,11 +1,16 @@
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { parseFinding, type AuditState } from "@heyo-sh/code-audit-core";
 
 const START = "<!-- heyo-code-audit-state:";
 const END = " -->";
+// Bounds the inflated state, so a forged marker cannot exhaust memory.
+const MAX_STATE_BYTES = 2_000_000;
 
 export function encodeAuditState(state: AuditState): string {
-  const json = JSON.stringify(state);
-  const encoded = Buffer.from(json, "utf8").toString("base64url");
+  // Compressed, so twenty detailed findings fit GitHub's Check output limit.
+  const encoded = deflateRawSync(
+    Buffer.from(JSON.stringify(state), "utf8"),
+  ).toString("base64url");
   if (encoded.length > 50_000)
     throw new Error("Heyo audit state exceeds GitHub Check output limits.");
   return `${START}${encoded}${END}`;
@@ -21,9 +26,9 @@ export function decodeAuditState(
   if (end < 0) return undefined;
   try {
     const raw = JSON.parse(
-      Buffer.from(
-        summary.slice(start + START.length, end),
-        "base64url",
+      inflateRawSync(
+        Buffer.from(summary.slice(start + START.length, end), "base64url"),
+        { maxOutputLength: MAX_STATE_BYTES },
       ).toString("utf8"),
     ) as Record<string, unknown>;
     if (

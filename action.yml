@@ -42,6 +42,10 @@ inputs:
     description: Publish a clean PR review when there are no findings.
     required: false
     default: "false"
+  summary-comment:
+    description: Keep one updatable PR comment with the confidence score, the verdict, linked findings, and a summary of the change. Requires report comment or check-and-comment.
+    required: false
+    default: "true"
   fail-on:
     description: Minimum finding severity that fails the audit.
     required: false
@@ -61,6 +65,19 @@ inputs:
     description: Maximum newly added commits for an incremental audit, or unlimited.
     required: false
     default: "20"
+  langfuse-public-key:
+    description: Optional Langfuse public key. With langfuse-secret-key, every Pi session is traced in Langfuse.
+    required: false
+  langfuse-secret-key:
+    description: Optional Langfuse secret key, set together with langfuse-public-key.
+    required: false
+  langfuse-base-url:
+    description: Langfuse host that receives the traces.
+    required: false
+    default: https://cloud.langfuse.com
+  langfuse-environment:
+    description: Optional Langfuse environment of the traces, for example ci.
+    required: false
 outputs:
   outcome:
     description: published, skipped, errored, stale, or skipped-fork-without-auth-token.

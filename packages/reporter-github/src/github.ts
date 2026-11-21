@@ -2,28 +2,48 @@ import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { promisify } from "node:util";
 import { Octokit } from "@octokit/rest";
-import type {
-  AuditConfig,
-  AuditPublisher,
-  AuditReport,
-  AuditRepository,
-  AuditState,
-  CommitMetadata,
-  PullRequestContext,
-  RepositorySnapshot,
+import {
+  isLowSignalPath,
+  LOCKFILE_NAMES,
+  type AuditConfig,
+  type AuditPublisher,
+  type AuditReport,
+  type AuditRepository,
+  type AuditState,
+  type ChangedFile,
+  type CommitMetadata,
+  type PullRequestContext,
+  type RepositorySnapshot,
 } from "@heyo-sh/code-audit-core";
 import { decodeAuditState, encodeAuditState } from "./state.js";
 import {
+  FINDING_MARKER_PREFIX,
   findingMarker,
   formatCheckAnnotation,
   formatCleanReview,
   formatInlineComment,
   formatSummary,
+  formatSummaryComment,
+  reviewCount,
+  SUMMARY_MARKER,
 } from "./format.js";
 
 const execFileAsync = promisify(execFile);
 const CHECK_NAME = "Heyo Code Audit";
-const MAX_DIFF_BYTES = 160_000;
+// The snapshot holds every discovery pass, so it is far larger than one
+// prompt. Lockfiles and generated files are excluded before this bound.
+const MAX_DIFF_BYTES = 1_200_000;
+// Enough context for the model to read a hunk without a tool call, small
+// enough that a medium pull request fits one discovery pass.
+const DIFF_CONTEXT_LINES = 20;
+const LOW_SIGNAL_PATHSPECS = [
+  ...[...LOCKFILE_NAMES].map((name) => `:(exclude,glob,icase)**/${name}`),
+  ":(exclude,glob)**/*.min.js",
+  ":(exclude,glob)**/*.min.css",
+  ":(exclude,glob)**/*.map",
+  ":(exclude,glob)**/*.snap",
+  ":(exclude,glob)**/__snapshots__/**",
+];
 const MAX_GUIDANCE_BYTES = 64_000;
 const MAX_GUIDANCE_FILE_BYTES = 16_000;
 const MAX_GUIDANCE_FILES = 24;
@@ -110,36 +130,42 @@ export class GitHubAuditRepository implements AuditRepository {
     assertSha(baseSha);
     assertSha(headSha);
     assertSha(guidanceBaseSha);
-    const changedPaths = (
-      await git(this.environment.repositoryPath, [
-        "diff",
-        "--name-only",
-        "--no-ext-diff",
-        `${baseSha}..${headSha}`,
-      ])
-    ).stdout
-      .split("\n")
-      .filter(Boolean)
-      .filter((path) => matchesAny(path, paths));
-    const pathArgs = paths.length ? ["--", ...paths] : [];
+    const range = `${baseSha}..${headSha}`;
+    const stats = parseNumstat(
+      (
+        await git(
+          this.environment.repositoryPath,
+          ["diff", "--numstat", "-z", "--no-ext-diff", "--find-renames", range],
+          8_000_000,
+        )
+      ).stdout,
+    ).filter((entry) => matchesAny(entry.path, paths));
+    const changedPaths = stats.map((entry) => entry.path);
     const diff = await boundedGitDiff(
       this.environment.repositoryPath,
       [
         "diff",
         "--no-ext-diff",
         "--no-color",
-        "--unified=80",
-        `${baseSha}..${headSha}`,
-        ...pathArgs,
+        "--find-renames",
+        `--unified=${DIFF_CONTEXT_LINES}`,
+        range,
+        "--",
+        ...paths,
+        ...LOW_SIGNAL_PATHSPECS,
       ],
       MAX_DIFF_BYTES,
+    );
+    const chunks = splitDiff(diff);
+    const files = stats.map((entry) =>
+      changedFile(entry, chunks.get(entry.path)),
     );
     const commits = parseCommits(
       (
         await git(this.environment.repositoryPath, [
           "log",
           "--format=%H%x00%s",
-          `${baseSha}..${headSha}`,
+          range,
         ])
       ).stdout,
     );
@@ -152,11 +178,36 @@ export class GitHubAuditRepository implements AuditRepository {
       repositoryPath: this.environment.repositoryPath,
       baseSha,
       headSha,
-      diff,
+      diff: files
+        .map((file) => file.diff)
+        .filter(Boolean)
+        .join("\n"),
+      files,
       changedPaths,
       guidance,
       commits,
     };
+  }
+
+  async mergeBase(baseSha: string, headSha: string): Promise<string> {
+    assertSha(baseSha);
+    assertSha(headSha);
+    let mergeBase: string;
+    try {
+      mergeBase = (
+        await git(this.environment.repositoryPath, [
+          "merge-base",
+          baseSha,
+          headSha,
+        ])
+      ).stdout.trim();
+    } catch {
+      throw new Error(
+        "Git could not find the pull request merge base. Check out the repository with fetch-depth: 0.",
+      );
+    }
+    assertSha(mergeBase);
+    return mergeBase;
   }
 
   async countCommits(baseSha: string, headSha: string): Promise<number> {
@@ -250,8 +301,11 @@ export class GitHubAuditPublisher implements AuditPublisher {
     const reportsReview =
       this.config.report === "comment" ||
       this.config.report === "check-and-comment";
-    const changedLineFindings = input.snapshot
-      ? findingsOnChangedLines(input.report.findings, input.snapshot.diff)
+    const located = input.report.findings.length
+      ? locatedFindings(
+          input.report.findings,
+          await this.reviewLocations(input.pr, input.snapshot?.diff ?? ""),
+        )
       : [];
     if (writesCheck) {
       const summary = checkSummary(input.report, input.state);
@@ -263,63 +317,121 @@ export class GitHubAuditPublisher implements AuditPublisher {
         status: "completed",
         conclusion: input.report.conclusion,
         output: {
-          title: `Heyo Code Audit: ${input.report.conclusion}`,
+          title: checkTitle(input.report),
           summary,
-          ...(changedLineFindings.length
-            ? {
-                annotations: changedLineFindings.map(formatCheckAnnotation),
-              }
+          ...(located.length
+            ? { annotations: located.slice(0, 50).map(formatCheckAnnotation) }
             : {}),
         },
       });
     }
-    if (reportsReview && changedLineFindings.length)
-      await this.publishReview(input.pr, changedLineFindings);
-    else if (
-      reportsReview &&
-      this.config.commentOnClean &&
-      input.report.findings.length === 0
-    )
+    if (!reportsReview) return;
+    const links = located.length
+      ? await this.publishReview(input.pr, located)
+      : new Map<string, string>();
+    if (this.config.commentOnClean && input.report.findings.length === 0)
       await this.publishCleanReview(input.pr, input.report);
+    if (this.config.summaryComment && input.report.assessment)
+      await this.publishSummaryComment(input.pr, input.report, links);
   }
 
-  private async publishReview(
+  /**
+   * Lines GitHub accepts for review comments: every right-side line of the
+   * pull request's own file patches. When those cannot be read, only added
+   * lines of the audited diff are used.
+   */
+  private async reviewLocations(
     pr: PullRequestContext,
-    findings: LocatedFinding[],
-  ): Promise<void> {
-    const existing = await this.client.paginate(
-      this.client.rest.pulls.listReviewComments,
-      {
+    diff: string,
+  ): Promise<Set<string>> {
+    let files: Array<{ filename: string; patch?: string | null }>;
+    try {
+      files = await this.client.paginate(this.client.rest.pulls.listFiles, {
         owner: pr.owner,
         repo: pr.repo,
         pull_number: pr.number,
         per_page: 100,
+      });
+    } catch {
+      return reviewableLocations(diff);
+    }
+    const locations = new Set<string>();
+    for (const file of files)
+      for (const line of commentableLines(file.patch ?? ""))
+        locations.add(locationKey(file.filename, line));
+    return locations;
+  }
+
+  /** Posts new findings inline and returns the comment URL of each finding. */
+  private async publishReview(
+    pr: PullRequestContext,
+    findings: LocatedFinding[],
+  ): Promise<Map<string, string>> {
+    const existing = (
+      await this.client.paginate(this.client.rest.pulls.listReviewComments, {
+        owner: pr.owner,
+        repo: pr.repo,
+        pull_number: pr.number,
+        per_page: 100,
+      })
+    ).filter(
+      (comment) =>
+        comment.user?.type === "Bot" &&
+        comment.body?.includes(FINDING_MARKER_PREFIX),
+    );
+    const links = new Map<string, string>();
+    for (const finding of findings) {
+      // The same finding, or a live comment of Heyo's on the same line, is
+      // not posted again on a later push.
+      const previous = existing.find(
+        (comment) =>
+          comment.body.includes(findingMarker(finding)) ||
+          (comment.path === finding.file && comment.line === finding.line),
+      );
+      if (previous) links.set(finding.fingerprint, previous.html_url);
+    }
+    const fresh = findings.filter((finding) => !links.has(finding.fingerprint));
+    if (!fresh.length) return links;
+    let reviewId: number;
+    try {
+      reviewId = (
+        await this.client.rest.pulls.createReview({
+          owner: pr.owner,
+          repo: pr.repo,
+          pull_number: pr.number,
+          commit_id: pr.headSha,
+          event: "COMMENT",
+          comments: fresh.map((finding) => ({
+            path: finding.file,
+            line: finding.line,
+            side: "RIGHT",
+            body: formatInlineComment(finding),
+          })),
+        })
+      ).data.id;
+    } catch (error) {
+      // GitHub rejects the whole review when one location no longer resolves.
+      // The findings stay in the Check and the summary comment instead.
+      if (httpStatus(error) === 422) return links;
+      throw error;
+    }
+    const created = await this.client.paginate(
+      this.client.rest.pulls.listCommentsForReview,
+      {
+        owner: pr.owner,
+        repo: pr.repo,
+        pull_number: pr.number,
+        review_id: reviewId,
+        per_page: 100,
       },
     );
-    const published = existing
-      .filter(
-        (comment) =>
-          comment.user?.type === "Bot" && comment.commit_id === pr.headSha,
-      )
-      .map((comment) => comment.body ?? "");
-    const fresh = findings.filter(
-      (finding) =>
-        !published.some((body) => body.includes(findingMarker(finding))),
-    );
-    if (!fresh.length) return;
-    await this.client.rest.pulls.createReview({
-      owner: pr.owner,
-      repo: pr.repo,
-      pull_number: pr.number,
-      commit_id: pr.headSha,
-      event: "COMMENT",
-      comments: fresh.map((finding) => ({
-        path: finding.file,
-        line: finding.line,
-        side: "RIGHT",
-        body: formatInlineComment(finding),
-      })),
-    });
+    for (const finding of fresh) {
+      const comment = created.find((candidate) =>
+        candidate.body.includes(findingMarker(finding)),
+      );
+      if (comment) links.set(finding.fingerprint, comment.html_url);
+    }
+    return links;
   }
 
   private async publishCleanReview(
@@ -334,6 +446,46 @@ export class GitHubAuditPublisher implements AuditPublisher {
       event: "COMMENT",
       body: formatCleanReview(report),
     });
+  }
+
+  /** Keeps one pull-request comment with the score, overview, and findings. */
+  private async publishSummaryComment(
+    pr: PullRequestContext,
+    report: AuditReport,
+    links: Map<string, string>,
+  ): Promise<void> {
+    const comments = await this.client.paginate(
+      this.client.rest.issues.listComments,
+      {
+        owner: pr.owner,
+        repo: pr.repo,
+        issue_number: pr.number,
+        per_page: 100,
+      },
+    );
+    const existing = comments.find(
+      (comment) =>
+        comment.user?.type === "Bot" && comment.body?.includes(SUMMARY_MARKER),
+    );
+    const body = formatSummaryComment(report, {
+      links,
+      reviews: reviewCount(existing?.body ?? "") + 1,
+      commitUrl: `https://github.com/${pr.owner}/${pr.repo}/commit/${pr.headSha}`,
+    });
+    if (existing)
+      await this.client.rest.issues.updateComment({
+        owner: pr.owner,
+        repo: pr.repo,
+        comment_id: existing.id,
+        body,
+      });
+    else
+      await this.client.rest.issues.createComment({
+        owner: pr.owner,
+        repo: pr.repo,
+        issue_number: pr.number,
+        body,
+      });
   }
 }
 
@@ -413,7 +565,7 @@ async function git(
   args: string[],
   maxBuffer = 1_000_000,
 ): Promise<{ stdout: string }> {
-  return execFileAsync("git", args, {
+  return execFileAsync("git", ["-c", "core.quotepath=false", ...args], {
     cwd,
     timeout: 30_000,
     maxBuffer,
@@ -429,7 +581,7 @@ async function boundedGitDiff(
   const marker = "\n[Diff truncated by Heyo]";
   const capacity = Math.max(0, maximum - Buffer.byteLength(marker));
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const child = spawn("git", ["-c", "core.quotepath=false", ...args], {
       cwd,
       env: { PATH: process.env.PATH ?? "" },
       stdio: ["ignore", "pipe", "pipe"],
@@ -505,11 +657,10 @@ type LocatedFinding = AuditReport["findings"][number] & {
   line: number;
 };
 
-function findingsOnChangedLines(
+function locatedFindings(
   findings: AuditReport["findings"],
-  diff: string,
+  locations: Set<string>,
 ): LocatedFinding[] {
-  const locations = reviewableLocations(diff);
   return findings.filter(
     (finding): finding is LocatedFinding =>
       typeof finding.file === "string" &&
@@ -518,7 +669,16 @@ function findingsOnChangedLines(
   );
 }
 
-/** Changed right-side lines are the only locations accepted by PR review APIs. */
+function checkTitle(report: AuditReport): string {
+  return report.assessment
+    ? `Confidence score ${report.assessment.score}/5 · ${report.assessment.verdict}`.slice(
+        0,
+        255,
+      )
+    : `Heyo Code Audit: ${report.conclusion}`;
+}
+
+/** Added right-side lines of a unified diff, the safest comment locations. */
 export function reviewableLocations(diff: string): Set<string> {
   const locations = new Set<string>();
   let file: string | undefined;
@@ -550,6 +710,113 @@ export function reviewableLocations(diff: string): Set<string> {
     }
   }
   return locations;
+}
+
+/** Right-side lines, added or context, of one GitHub file patch. */
+export function commentableLines(patch: string): number[] {
+  const lines: number[] = [];
+  let headLine = 0;
+  for (const patchLine of patch.split("\n")) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(patchLine);
+    if (hunk?.[1]) {
+      headLine = Number(hunk[1]);
+      continue;
+    }
+    if (headLine === 0 || patchLine.startsWith("-")) continue;
+    if (patchLine.startsWith("+") || patchLine.startsWith(" ")) {
+      lines.push(headLine);
+      headLine += 1;
+    }
+  }
+  return lines;
+}
+
+interface NumstatEntry {
+  path: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  renamed: boolean;
+}
+
+/** Parses `git diff --numstat -z`, including rename records. */
+export function parseNumstat(output: string): NumstatEntry[] {
+  const tokens = output.split("\0");
+  const entries: NumstatEntry[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const match = /^(-|\d+)\t(-|\d+)\t(.*)$/s.exec(tokens[index] ?? "");
+    if (!match) continue;
+    let path = match[3] ?? "";
+    const renamed = path === "";
+    // A rename record is followed by the old and the new path.
+    if (renamed) {
+      path = tokens[index + 2] ?? "";
+      index += 2;
+    }
+    if (!path) continue;
+    entries.push({
+      path,
+      additions: match[1] === "-" ? 0 : Number(match[1]),
+      deletions: match[2] === "-" ? 0 : Number(match[2]),
+      binary: match[1] === "-",
+      renamed,
+    });
+  }
+  return entries;
+}
+
+/** Splits a unified diff into per-file chunks keyed by the head path. */
+export function splitDiff(diff: string): Map<string, string> {
+  const chunks = new Map<string, string>();
+  const parts = diff.split(/^(?=diff --git )/m);
+  for (const part of parts) {
+    if (!part.startsWith("diff --git ")) continue;
+    const path =
+      /^\+\+\+ b\/(.+)$/m.exec(part)?.[1] ??
+      /^rename to (.+)$/m.exec(part)?.[1] ??
+      /^--- a\/(.+)$/m.exec(part)?.[1] ??
+      headerPath(part);
+    if (path) chunks.set(path, part.replace(/\n$/, ""));
+  }
+  return chunks;
+}
+
+/** The head path of a `diff --git a/<old> b/<new>` header, without backtracking. */
+function headerPath(part: string): string | undefined {
+  const newline = part.indexOf("\n");
+  const header = newline < 0 ? part : part.slice(0, newline);
+  const separator = header.lastIndexOf(" b/");
+  return separator > "diff --git a/".length
+    ? header.slice(separator + " b/".length) || undefined
+    : undefined;
+}
+
+function changedFile(
+  entry: NumstatEntry,
+  chunk: string | undefined,
+): ChangedFile {
+  const status: ChangedFile["status"] = entry.renamed
+    ? "renamed"
+    : chunk && /^new file mode /m.test(chunk)
+      ? "added"
+      : chunk && /^deleted file mode /m.test(chunk)
+        ? "deleted"
+        : "modified";
+  const lowSignal = entry.binary || isLowSignalPath(entry.path);
+  let diff = lowSignal ? "" : (chunk ?? "");
+  // A deleted file's content adds nothing the base version does not show.
+  if (status === "deleted" && diff) {
+    const header = diff.split(/^@@/m)[0] ?? "";
+    diff = `${header}[Deleted file: ${entry.deletions} lines removed. Use read_base_file to inspect it.]`;
+  }
+  return {
+    path: entry.path,
+    status,
+    additions: entry.additions,
+    deletions: entry.deletions,
+    diff,
+    lowSignal,
+  };
 }
 
 function headPath(diffLine: string): string | undefined {
@@ -591,6 +858,14 @@ function glob(pattern: string): RegExp {
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function httpStatus(error: unknown): number | undefined {
+  return error instanceof Error &&
+    "status" in error &&
+    typeof error.status === "number"
+    ? error.status
+    : undefined;
 }
 
 function exitCode(error: unknown): number | undefined {

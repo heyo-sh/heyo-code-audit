@@ -6,6 +6,11 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    ignore:
+      # The OpenTelemetry SDK 2.x that Langfuse tracing needs supports the API
+      # up to 1.9. Lift this when Langfuse supports OpenTelemetry SDK 3.
+      - dependency-name: "@opentelemetry/api"
+        versions: [">=1.10.0"]
     groups:
       development-dependencies:
         dependency-type: development
