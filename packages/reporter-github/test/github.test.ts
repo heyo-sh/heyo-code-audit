@@ -8,10 +8,13 @@ import {
   GitHubAuditPublisher,
   GitHubAuditRepository,
   GitHubReviewProgress,
+  commentableLines,
   createGitHubClient,
   decodeAuditState,
   encodeAuditState,
+  parseNumstat,
   reviewableLocations,
+  splitDiff,
 } from "../src/index.js";
 import {
   parseAuditConfig,
@@ -71,16 +74,26 @@ function fakeClient() {
     checks: [] as unknown[],
     reviews: [] as unknown[],
     reactions: [] as unknown[],
+    comments: [] as Array<{ kind: string; input: unknown }>,
   };
   const order: string[] = [];
   const functions = {
     listCommits: async () => [],
     listForRef: async () => [],
     listReviewComments: async () => [],
+    listFiles: async () => [],
+    listCommentsForReview: async () => [],
+    listComments: async () => [],
   };
-  let commitRows: unknown[] = [];
-  let checks: unknown[] = [];
-  let reviewComments: unknown[] = [];
+  const rows = {
+    commitRows: [] as unknown[],
+    checks: [] as unknown[],
+    reviewComments: [] as unknown[],
+    files: [] as unknown[] | Error,
+    reviewCommentsCreated: [] as unknown[],
+    issueComments: [] as unknown[],
+    reviewError: undefined as Error | undefined,
+  };
   const client = {
     rest: {
       pulls: {
@@ -92,11 +105,12 @@ function fakeClient() {
             body: null,
           },
         }),
-        listCommits: functions.listCommits,
-        listReviewComments: functions.listReviewComments,
+        ...functions,
         createReview: async (input: unknown) => {
           order.push("review");
           calls.reviews.push(input);
+          if (rows.reviewError) throw rows.reviewError;
+          return { data: { id: 99 } };
         },
       },
       checks: {
@@ -104,6 +118,17 @@ function fakeClient() {
         create: async (input: unknown) => {
           order.push("check");
           calls.checks.push(input);
+        },
+      },
+      issues: {
+        listComments: functions.listComments,
+        createComment: async (input: unknown) => {
+          order.push("summary");
+          calls.comments.push({ kind: "create", input });
+        },
+        updateComment: async (input: unknown) => {
+          order.push("summary");
+          calls.comments.push({ kind: "update", input });
         },
       },
       reactions: {
@@ -118,27 +143,47 @@ function fakeClient() {
         },
       },
     },
-    paginate: async (method: unknown) =>
-      method === functions.listCommits
-        ? commitRows
-        : method === functions.listForRef
-          ? checks
-          : reviewComments,
+    paginate: async (method: unknown) => {
+      if (method === functions.listCommits) return rows.commitRows;
+      if (method === functions.listForRef) return rows.checks;
+      if (method === functions.listFiles) {
+        if (rows.files instanceof Error) throw rows.files;
+        return rows.files;
+      }
+      if (method === functions.listCommentsForReview)
+        return rows.reviewCommentsCreated;
+      if (method === functions.listComments) return rows.issueComments;
+      return rows.reviewComments;
+    },
   };
   return {
     client: client as never,
     calls,
     order,
-    setRows: (next: {
-      commitRows?: unknown[];
-      checks?: unknown[];
-      reviewComments?: unknown[];
-    }) => {
-      commitRows = next.commitRows ?? commitRows;
-      checks = next.checks ?? checks;
-      reviewComments = next.reviewComments ?? reviewComments;
-    },
+    setRows: (next: Partial<typeof rows>) => Object.assign(rows, next),
   };
+}
+
+function httpError(status: number): Error {
+  return Object.assign(new Error(`HTTP ${status}`), { status });
+}
+
+async function repositoryFixture(prefix: string) {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  temporary.push(directory);
+  await exec("git", ["init", "-q"], { cwd: directory });
+  await exec("git", ["config", "user.email", "audit@example.test"], {
+    cwd: directory,
+  });
+  await exec("git", ["config", "user.name", "Audit"], { cwd: directory });
+  const commit = async (message: string) => {
+    await exec("git", ["add", "-A"], { cwd: directory });
+    await exec("git", ["commit", "-qm", message], { cwd: directory });
+    return (
+      await exec("git", ["rev-parse", "HEAD"], { cwd: directory })
+    ).stdout.trim();
+  };
+  return { directory, commit };
 }
 
 describe("GitHub adapter", () => {
@@ -225,62 +270,122 @@ describe("GitHub adapter", () => {
     );
   });
 
-  test("reads bounded git snapshots and detects ancestry without shell interpolation", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "heyo-github-"));
-    temporary.push(directory);
-    await exec("git", ["init", "-q"], { cwd: directory });
-    await exec("git", ["config", "user.email", "audit@example.test"], {
-      cwd: directory,
-    });
-    await exec("git", ["config", "user.name", "Audit"], { cwd: directory });
+  test("reads per-file git snapshots and detects ancestry without shell interpolation", async () => {
+    const { directory, commit } = await repositoryFixture("heyo-github-");
     await writeFile(join(directory, "app.ts"), "export const version = 1;\n");
-    await exec("git", ["add", "."], { cwd: directory });
-    await exec("git", ["commit", "-qm", "base"], { cwd: directory });
-    const initial = (
-      await exec("git", ["rev-parse", "HEAD"], { cwd: directory })
-    ).stdout.trim();
+    await writeFile(
+      join(directory, "old-name.ts"),
+      "export const a = 1;\n".repeat(5),
+    );
+    await writeFile(join(directory, "gone.ts"), "export const gone = 1;\n");
+    const initial = await commit("base");
     await writeFile(join(directory, "app.ts"), "export const version = 2;\n");
     await writeFile(join(directory, "notes.md"), "changed\n");
-    await exec("git", ["add", "."], { cwd: directory });
-    await exec("git", ["commit", "-qm", "change app"], { cwd: directory });
-    const current = (
-      await exec("git", ["rev-parse", "HEAD"], { cwd: directory })
-    ).stdout.trim();
+    await writeFile(join(directory, "pnpm-lock.yaml"), "lock: 2\n");
+    await writeFile(
+      join(directory, "logo.png"),
+      Buffer.from([0, 1, 2, 0, 255]),
+    );
+    await writeFile(join(directory, "ünïcode.ts"), "export const u = 1;\n");
+    await exec("git", ["mv", "old-name.ts", "new-name.ts"], { cwd: directory });
+    await exec("git", ["rm", "-q", "gone.ts"], { cwd: directory });
+    const current = await commit("change app");
     const repository = new GitHubAuditRepository(fakeClient().client, {
       owner: "heyo",
       repo: "audit",
       prNumber: 7,
       repositoryPath: directory,
     });
-    const snapshot = await repository.getSnapshot(initial, current, ["*.ts"]);
-    expect(snapshot.changedPaths).toEqual(["app.ts"]);
+    const filtered = await repository.getSnapshot(initial, current, ["*.ts"]);
+    expect(filtered.changedPaths).toEqual([
+      "app.ts",
+      "gone.ts",
+      "new-name.ts",
+      "ünïcode.ts",
+    ]);
+    const snapshot = await repository.getSnapshot(initial, current, []);
     expect(snapshot.guidance).toEqual([]);
-    expect(snapshot.diff).toContain("version = 2");
+    expect(snapshot.commits).toEqual([{ sha: current, message: "change app" }]);
+    const byPath = new Map(snapshot.files.map((file) => [file.path, file]));
+    expect(byPath.get("app.ts")).toMatchObject({
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      lowSignal: false,
+      diff: expect.stringContaining("+export const version = 2;"),
+    });
+    expect(byPath.get("new-name.ts")).toMatchObject({ status: "renamed" });
+    // Bun's toMatchObject replaces matched values, so plain values come first.
+    expect(byPath.get("gone.ts")?.diff).not.toContain("export const gone");
+    expect(byPath.get("gone.ts")).toMatchObject({
+      status: "deleted",
+      diff: expect.stringContaining("[Deleted file: 1 lines removed."),
+    });
+    expect(byPath.get("notes.md")).toMatchObject({ status: "added" });
+    expect(byPath.get("ünïcode.ts")?.diff).toContain("+export const u = 1;");
+    expect(byPath.get("pnpm-lock.yaml")).toMatchObject({
+      lowSignal: true,
+      diff: "",
+      additions: 1,
+    });
+    expect(byPath.get("logo.png")).toMatchObject({ lowSignal: true, diff: "" });
+    expect(snapshot.diff).toContain("+export const version = 2;");
+    expect(snapshot.diff).not.toContain("lock: 2");
     expect(await repository.countCommits(initial, current)).toBe(1);
     expect(await repository.isAncestor(initial, current)).toBe(true);
     expect(await repository.isAncestor(current, initial)).toBe(false);
+    await expect(
+      repository.isAncestor(initial, "f".repeat(40)),
+    ).rejects.toThrow();
 
-    await writeFile(join(directory, "large.txt"), "a".repeat(200_000));
-    await exec("git", ["add", "."], { cwd: directory });
-    await exec("git", ["commit", "-qm", "large base"], { cwd: directory });
-    const largeBase = (
-      await exec("git", ["rev-parse", "HEAD"], { cwd: directory })
-    ).stdout.trim();
-    await writeFile(join(directory, "large.txt"), "b".repeat(200_000));
-    await exec("git", ["add", "."], { cwd: directory });
-    await exec("git", ["commit", "-qm", "large change"], {
-      cwd: directory,
-    });
-    const largeHead = (
-      await exec("git", ["rev-parse", "HEAD"], { cwd: directory })
-    ).stdout.trim();
+    await writeFile(join(directory, "large.txt"), "a\n".repeat(700_000));
+    const largeBase = await commit("large base");
+    await writeFile(join(directory, "large.txt"), "b\n".repeat(700_000));
+    const largeHead = await commit("large change");
     const largeSnapshot = await repository.getSnapshot(
       largeBase,
       largeHead,
       [],
     );
-    expect(Buffer.byteLength(largeSnapshot.diff)).toBeLessThanOrEqual(160_000);
-    expect(largeSnapshot.diff).toEndWith("[Diff truncated by Heyo]");
+    expect(largeSnapshot.files[0]?.diff).toEndWith("[Diff truncated by Heyo]");
+    expect(Buffer.byteLength(largeSnapshot.diff)).toBeLessThanOrEqual(
+      1_200_000,
+    );
+  });
+
+  test("diffs a pull request against its merge base, not the moving target branch", async () => {
+    const { directory, commit } = await repositoryFixture("heyo-merge-base-");
+    await writeFile(join(directory, "shared.ts"), "export const shared = 1;\n");
+    const fork = await commit("fork point");
+    await exec("git", ["checkout", "-qb", "feature"], { cwd: directory });
+    await writeFile(join(directory, "feature.ts"), "export const f = 1;\n");
+    const featureHead = await commit("feature");
+    await exec("git", ["checkout", "-q", "-"], { cwd: directory });
+    await writeFile(join(directory, "target-only.ts"), "export const t = 1;\n");
+    const targetHead = await commit("target moved on");
+    const repository = new GitHubAuditRepository(fakeClient().client, {
+      owner: "heyo",
+      repo: "audit",
+      prNumber: 7,
+      repositoryPath: directory,
+    });
+    const mergeBase = await repository.mergeBase(targetHead, featureHead);
+    expect(mergeBase).toBe(fork);
+    const snapshot = await repository.getSnapshot(
+      mergeBase,
+      featureHead,
+      [],
+      targetHead,
+    );
+    expect(snapshot.changedPaths).toEqual(["feature.ts"]);
+    await writeFile(join(directory, "unrelated.ts"), "x\n");
+    await exec("git", ["checkout", "-q", "--orphan", "island"], {
+      cwd: directory,
+    });
+    const island = await commit("unrelated history");
+    await expect(repository.mergeBase(targetHead, island)).rejects.toThrow(
+      "fetch-depth: 0",
+    );
   });
 
   test("loads only applicable, regular AGENTS.md files from the target base", async () => {
@@ -437,7 +542,7 @@ describe("GitHub adapter", () => {
     expect(snapshot.changedPaths).toEqual(["root.ts", "src/nested.ts"]);
   });
 
-  test("publishes changed-line findings as Check annotations and inline review comments", async () => {
+  test("publishes located findings as Check annotations, inline comments, and a summary comment", async () => {
     const fake = fakeClient();
     const config = parseAuditConfig({
       model: "gpt-5.6-terra",
@@ -455,34 +560,54 @@ describe("GitHub adapter", () => {
       description:
         "The changed handler reads an account without a tenant check.",
       evidence: "The new return sends the loaded account to the caller.",
+      recommendation: "Compare the tenant before returning.",
       file: "src/route.ts",
       line: 12,
       suggestion:
         "return account.tenantId === tenant.id ? account : undefined;",
     };
-    const diff = [
-      "diff --git a/src/route.ts b/src/route.ts",
-      "--- a/src/route.ts",
-      "+++ b/src/route.ts",
-      "@@ -12 +12 @@ export function getAccount() {",
-      "-  return account;",
-      "+  return account;",
-    ].join("\n");
-    const unchangedFinding = {
+    const contextFinding = {
       ...finding,
-      fingerprint: "not-on-a-changed-line",
-      title: "Do not annotate unchanged code",
-      line: 13,
+      fingerprint: "on-a-context-line",
+      title: "Context lines accept comments",
+      severity: "medium" as const,
+      line: 11,
     };
-    await publisher.publish({
-      pr,
-      report: {
-        ...report,
-        conclusion: "failure",
-        findings: [finding, unchangedFinding],
-      },
-      snapshot: { diff },
+    const outsideFinding = {
+      ...finding,
+      fingerprint: "outside-the-diff",
+      title: "Unchanged caller breaks",
+      severity: "low" as const,
+      file: "src/caller.ts",
+      line: 40,
+    };
+    fake.setRows({
+      files: [
+        {
+          filename: "src/route.ts",
+          patch:
+            "@@ -10,3 +10,3 @@\n ctx();\n context();\n-  return account;\n+  return account;",
+        },
+        { filename: "assets/logo.png" },
+      ],
+      reviewCommentsCreated: [
+        {
+          body: "<!-- heyo-code-audit-finding:a-verified-finding -->",
+          html_url: "https://github.test/c/1",
+        },
+      ],
     });
+    const findings = [finding, contextFinding, outsideFinding];
+    const assessed = {
+      ...report,
+      conclusion: "failure" as const,
+      findings,
+      assessment: {
+        score: 3 as const,
+        verdict: "Fix 1 blocking finding before merging.",
+      },
+    };
+    await publisher.publish({ pr, report: assessed });
     expect(fake.calls.reviews).toEqual([
       {
         owner: pr.owner,
@@ -499,13 +624,16 @@ describe("GitHub adapter", () => {
               "```suggestion\nreturn account.tenantId === tenant.id ? account : undefined;\n```",
             ),
           },
+          expect.objectContaining({ path: "src/route.ts", line: 11 }),
         ],
       },
     ]);
-    expect(fake.order).toEqual(["check", "review"]);
+    expect(fake.order).toEqual(["check", "review", "summary"]);
     expect(fake.calls.checks).toEqual([
       expect.objectContaining({
         output: expect.objectContaining({
+          title:
+            "Confidence score 3/5 · Fix 1 blocking finding before merging.",
           annotations: [
             {
               path: "src/route.ts",
@@ -514,32 +642,130 @@ describe("GitHub adapter", () => {
               annotation_level: "failure",
               title: "HIGH · SECURITY: Authorize the account lookup",
               message:
-                "The changed handler reads an account without a tenant check.\n\nEvidence: The new return sends the loaded account to the caller.",
+                "The changed handler reads an account without a tenant check.\n\nFix: Compare the tenant before returning.\n\nEvidence: The new return sends the loaded account to the caller.",
             },
+            expect.objectContaining({ start_line: 11 }),
           ],
         }),
       }),
     ]);
+    const summary = fake.calls.comments[0] as {
+      kind: string;
+      input: { body: string; issue_number: number };
+    };
+    expect(summary.kind).toBe("create");
+    expect(summary.input.issue_number).toBe(pr.number);
+    expect(summary.input.body).toContain("Confidence Score: 3/5");
+    expect(summary.input.body).toContain(
+      "**Authorize the account lookup** — `src/route.ts:12` [▶](https://github.test/c/1)",
+    );
+    expect(summary.input.body).toContain("Findings without an inline comment");
+    expect(summary.input.body).toContain("Unchanged caller breaks");
+    expect(summary.input.body).toContain("Reviews (1)");
+    expect(summary.input.body).toContain(
+      `https://github.com/heyo/audit/commit/${head}`,
+    );
 
+    // A later push neither duplicates a posted finding nor a live comment on
+    // the same line, and the summary comment is updated in place.
     fake.setRows({
       reviewComments: [
         {
           user: { type: "Bot" },
-          commit_id: pr.headSha,
+          path: "src/other.ts",
+          line: 1,
           body: "<!-- heyo-code-audit-finding:a-verified-finding -->",
+          html_url: "https://github.test/c/1",
+        },
+        {
+          user: { type: "Bot" },
+          path: "src/route.ts",
+          line: 11,
+          body: "<!-- heyo-code-audit-finding:reworded -->",
+          html_url: "https://github.test/c/2",
+        },
+        { user: { type: "User" }, body: "<!-- heyo-code-audit-finding:x -->" },
+        { user: { type: "Bot" }, body: null },
+      ],
+      issueComments: [
+        {
+          user: { type: "User" },
+          body: "<!-- heyo-code-audit-summary -->",
+          id: 1,
+        },
+        {
+          user: { type: "Bot" },
+          id: 5,
+          body: "<!-- heyo-code-audit-summary -->\n<!-- heyo-code-audit-reviews:4 -->",
         },
       ],
     });
-    await publisher.publish({
-      pr,
-      report: {
-        ...report,
-        conclusion: "failure",
-        findings: [finding, unchangedFinding],
-      },
-      snapshot: { diff },
-    });
+    await publisher.publish({ pr, report: assessed });
     expect(fake.calls.reviews).toHaveLength(1);
+    expect(fake.calls.comments[1]).toEqual({
+      kind: "update",
+      input: expect.objectContaining({
+        comment_id: 5,
+        body: expect.stringContaining("Reviews (5)"),
+      }),
+    });
+    expect((fake.calls.comments[1]?.input as { body: string }).body).toContain(
+      "[▶](https://github.test/c/2)",
+    );
+  });
+
+  test("keeps findings in the Check and summary when GitHub rejects inline locations", async () => {
+    const fake = fakeClient();
+    const config = parseAuditConfig({
+      model: "gpt-5.6-terra",
+      "auth-type": "api-key",
+      "auth-token": "provider",
+      "github-token": "github",
+    });
+    const publisher = new GitHubAuditPublisher(fake.client, config);
+    const finding = {
+      fingerprint: "f",
+      check: "functional" as const,
+      severity: "medium" as const,
+      confidence: "high" as const,
+      title: "Title",
+      description: "Description",
+      evidence: "Evidence",
+      file: "src/route.ts",
+      line: 12,
+    };
+    const diff = [
+      "diff --git a/src/route.ts b/src/route.ts",
+      "--- a/src/route.ts",
+      "+++ b/src/route.ts",
+      "@@ -12 +12 @@",
+      "-old();",
+      "+new();",
+    ].join("\n");
+    // Without the PR file list, only added lines of the audited diff are used.
+    fake.setRows({
+      files: new Error("rate limited"),
+      reviewError: httpError(422),
+    });
+    const assessed = {
+      ...report,
+      findings: [finding],
+      assessment: { score: 4 as const, verdict: "Safe." },
+    };
+    await publisher.publish({ pr, report: assessed, snapshot: { diff } });
+    expect(fake.calls.reviews).toHaveLength(1);
+    expect(fake.order).toEqual(["check", "review", "summary"]);
+    expect((fake.calls.comments[0]?.input as { body: string }).body).toContain(
+      "Findings without an inline comment",
+    );
+
+    fake.setRows({ reviewError: httpError(500) });
+    await expect(
+      publisher.publish({ pr, report: assessed, snapshot: { diff } }),
+    ).rejects.toThrow("HTTP 500");
+    fake.setRows({ files: [] });
+    await publisher.publish({ pr, report: assessed });
+    expect(fake.calls.reviews).toHaveLength(2);
   });
 
   test("publishes Check annotations without comments in check mode", async () => {
@@ -552,6 +778,9 @@ describe("GitHub adapter", () => {
       report: "check",
     });
     const publisher = new GitHubAuditPublisher(fake.client, config);
+    fake.setRows({
+      files: [{ filename: "src/route.ts", patch: "@@ -12 +12 @@\n-a\n+b" }],
+    });
     await publisher.publish({
       pr,
       report: {
@@ -571,22 +800,14 @@ describe("GitHub adapter", () => {
           },
         ],
       },
-      snapshot: {
-        diff: [
-          "diff --git a/src/route.ts b/src/route.ts",
-          "--- a/src/route.ts",
-          "+++ b/src/route.ts",
-          "@@ -12 +12 @@ export function handler() {",
-          "-  return { value };",
-          "+  return {};",
-        ].join("\n"),
-      },
     });
 
     expect(fake.calls.reviews).toHaveLength(0);
+    expect(fake.calls.comments).toHaveLength(0);
     expect(fake.calls.checks).toEqual([
       expect.objectContaining({
         output: expect.objectContaining({
+          title: "Heyo Code Audit: failure",
           annotations: [
             expect.objectContaining({
               annotation_level: "warning",
@@ -599,7 +820,7 @@ describe("GitHub adapter", () => {
     ]);
   });
 
-  test("keeps only changed right-side lines eligible for inline comments", () => {
+  test("finds comment locations in unified diffs and GitHub patches", () => {
     const locations = reviewableLocations(
       [
         "diff --git a/src/app.ts b/src/app.ts",
@@ -610,10 +831,85 @@ describe("GitHub adapter", () => {
         "-removed();",
         "+added();",
         "+alsoAdded();",
+        "\\ No newline at end of file",
         " unchangedAgain();",
+        "diff --git a/gone.ts b/gone.ts",
+        "--- a/gone.ts",
+        "+++ /dev/null",
+        "@@ -1 +0,0 @@",
+        "-gone();",
       ].join("\n"),
     );
     expect([...locations]).toEqual(["src/app.ts\u00009", "src/app.ts\u000010"]);
+    expect(
+      commentableLines(
+        "@@ -8,3 +8,4 @@\n unchanged();\n-removed();\n+added();\n\\ No newline\n unchangedAgain();",
+      ),
+    ).toEqual([8, 9, 10]);
+    expect(commentableLines("")).toEqual([]);
+  });
+
+  test("parses git numstat records and splits diffs by file", () => {
+    expect(
+      parseNumstat(
+        [
+          "3\t1\tsrc/a.ts",
+          "-\t-\tlogo.png",
+          "2\t2\t",
+          "old.ts",
+          "new.ts",
+          "bad",
+          "1\t0\t",
+          "",
+        ].join("\0"),
+      ),
+    ).toEqual([
+      {
+        path: "src/a.ts",
+        additions: 3,
+        deletions: 1,
+        binary: false,
+        renamed: false,
+      },
+      {
+        path: "logo.png",
+        additions: 0,
+        deletions: 0,
+        binary: true,
+        renamed: false,
+      },
+      {
+        path: "new.ts",
+        additions: 2,
+        deletions: 2,
+        binary: false,
+        renamed: true,
+      },
+    ]);
+    const chunks = splitDiff(
+      [
+        "preamble",
+        "diff --git a/a.ts b/a.ts",
+        "+++ b/a.ts",
+        "diff --git a/old.ts b/new.ts",
+        "rename from old.ts",
+        "rename to new.ts",
+        "diff --git a/gone.ts b/gone.ts",
+        "--- a/gone.ts",
+        "+++ /dev/null",
+        "diff --git a/logo.png b/logo.png",
+        "Binary files a/logo.png and b/logo.png differ",
+        "diff --git weird",
+        "",
+      ].join("\n"),
+    );
+    expect([...chunks.keys()]).toEqual([
+      "a.ts",
+      "new.ts",
+      "gone.ts",
+      "logo.png",
+    ]);
+    expect(chunks.get("a.ts")).toBe("diff --git a/a.ts b/a.ts\n+++ b/a.ts");
   });
 
   test("publishes a clean PR review and supports review-only reporting", async () => {
@@ -624,10 +920,16 @@ describe("GitHub adapter", () => {
       "auth-token": "provider",
       "github-token": "github",
       "comment-on-clean": "true",
+      "summary-comment": "false",
     });
     const publisher = new GitHubAuditPublisher(fake.client, config);
-    await publisher.publish({ pr, report, state });
+    await publisher.publish({
+      pr,
+      report: { ...report, assessment: { score: 5, verdict: "Safe." } },
+      state,
+    });
     expect(fake.calls.checks).toHaveLength(1);
+    expect(fake.calls.comments).toHaveLength(0);
     expect(fake.calls.reviews).toEqual([
       {
         owner: pr.owner,
@@ -644,6 +946,12 @@ describe("GitHub adapter", () => {
       ...config,
       report: "comment",
       commentOnClean: false,
+      summaryComment: true,
+    });
+    fake.setRows({
+      files: [
+        { filename: "src/route.ts", patch: "@@ -12 +12 @@\n-old();\n+new();" },
+      ],
     });
     await reviewOnly.publish({
       pr,
@@ -663,19 +971,11 @@ describe("GitHub adapter", () => {
           },
         ],
       },
-      snapshot: {
-        diff: [
-          "diff --git a/src/route.ts b/src/route.ts",
-          "--- a/src/route.ts",
-          "+++ b/src/route.ts",
-          "@@ -12 +12 @@",
-          "-old();",
-          "+new();",
-        ].join("\n"),
-      },
     });
     expect(fake.calls.checks).toHaveLength(1);
     expect(fake.calls.reviews).toHaveLength(2);
+    // An unscored report, such as an error, never replaces the summary.
+    expect(fake.calls.comments).toHaveLength(0);
     expect(createGitHubClient("token")).toBeDefined();
   });
 
@@ -694,13 +994,20 @@ describe("GitHub adapter", () => {
       severity: "high" as const,
       confidence: "high" as const,
       title: `Finding ${index}`,
-      description: "d".repeat(800),
-      evidence: "e".repeat(800),
+      description: "d".repeat(1_000),
+      evidence: "e".repeat(1_000),
+      recommendation: "r".repeat(500),
+      file: `src/file-${index}.ts`,
+      line: index + 1,
     }));
     const publisher = new GitHubAuditPublisher(fake.client, config);
     await publisher.publish({
       pr,
-      report: { ...report, conclusion: "failure", findings },
+      report: {
+        ...report,
+        conclusion: "failure",
+        findings: [...findings, ...findings, ...findings],
+      },
       state: { ...state, findings },
     });
 
@@ -719,15 +1026,20 @@ describe("GitHub adapter", () => {
       "github-token": "github",
       report: "check",
     });
+    const random = (length: number) =>
+      Array.from({ length }, () => Math.random().toString(36).slice(2)).join(
+        "",
+      );
     const findings = Array.from({ length: 20 }, (_, index) => ({
       fingerprint: `finding-${index}`,
       check: "functional" as const,
       severity: "high" as const,
       confidence: "high" as const,
-      title: `Finding ${index} ${"t".repeat(140)}`,
-      description: "d".repeat(800),
-      evidence: "e".repeat(800),
-      file: `src/${"p".repeat(490)}.ts`,
+      title: `Finding ${index}`,
+      description: random(100).slice(0, 1_000),
+      evidence: random(100).slice(0, 1_000),
+      recommendation: random(60).slice(0, 500),
+      file: `src/${random(60).slice(0, 490)}.ts`,
       line: index + 1,
     }));
     const publisher = new GitHubAuditPublisher(fake.client, config);

@@ -6,9 +6,10 @@ import {
   type FauxProviderRegistration,
 } from "@mariozechner/pi-ai";
 import { PiAuditRuntime, extractJson, providerModel } from "../src/index.js";
-import type {
-  RepositorySnapshot,
-  RuntimeInput,
+import {
+  AuditSessionError,
+  type RepositorySnapshot,
+  type RuntimeInput,
 } from "@heyo-sh/code-audit-core";
 
 let registration: FauxProviderRegistration | undefined;
@@ -44,6 +45,7 @@ const snapshot: RepositorySnapshot = {
   baseSha: input.baseSha,
   headSha: input.headSha,
   diff: "",
+  files: [],
   changedPaths: [],
   guidance: [],
   commits: [],
@@ -55,6 +57,24 @@ describe("Pi runtime helpers", () => {
       '{"findings":[]}',
     );
     expect(extractJson('{"verified":false}')).toBe('{"verified":false}');
+    expect(
+      extractJson('Here is the result:\n```json\n{"findings":[]}\n```\nDone.'),
+    ).toBe('{"findings":[]}');
+    expect(extractJson("no json at all")).toBe("no json at all");
+    // Two answers, prose braces, escaped quotes, and raw line breaks.
+    expect(extractJson('{"findings":[]}{"findings":[]}')).toBe(
+      '{"findings":[]}',
+    );
+    expect(
+      extractJson(
+        'Checked `{a}` and {"verified":false,"reason":"say \\"no\\""}',
+      ),
+    ).toBe('{"verified":false,"reason":"say \\"no\\""}');
+    expect(
+      JSON.parse(extractJson('{"suggestion":"  a()\n\tb()\r"}')).suggestion,
+    ).toBe("  a()\n\tb()\r");
+    expect(extractJson('{"broken": {"x": 1}')).toBe('{"x": 1}');
+    expect(extractJson("{not json}")).toBe("{not json}");
     expect(providerModel("openai", "gpt-5.6-terra")).toMatchObject({
       id: "gpt-5.6-terra",
       provider: "openai",
@@ -79,6 +99,19 @@ describe("Pi runtime helpers", () => {
     await expect(
       runtime.run({ ...input, phase: "verification" }),
     ).resolves.toEqual({ verified: false, reason: "not reproducible" });
+    registration.setResponses([
+      fauxAssistantMessage(
+        '{"summary":"Adds a route.","changes":["Route"],"impact":"low","impactReason":"Internal."}',
+      ),
+    ]);
+    await expect(runtime.run({ ...input, phase: "summary" })).resolves.toEqual({
+      overview: {
+        summary: "Adds a route.",
+        changes: ["Route"],
+        impact: "low",
+        impactReason: "Internal.",
+      },
+    });
   });
 
   test("passes AWS and bearer authentication to Bedrock streams", async () => {
@@ -153,9 +186,15 @@ describe("Pi runtime helpers", () => {
       fauxAssistantMessage('{"findings":[]}'),
     ]);
     const runtime = new PiAuditRuntime({ resolve: async () => snapshot });
-    await expect(
-      runtime.run({ ...input, limits: { ...input.limits, maxTurns: 1 } }),
-    ).rejects.toThrow("exceeded the turn limit (1)");
+    const failure = await runtime
+      .run({ ...input, limits: { ...input.limits, maxTurns: 1 } })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AuditSessionError);
+    expect((failure as AuditSessionError).message).toContain(
+      "exceeded the turn limit (1)",
+    );
+    // The same budget would run out again, so the audit must not retry it.
+    expect((failure as AuditSessionError).retryable).toBe(false);
   });
 
   test("classifies provider errors without disclosing their raw messages", async () => {
@@ -177,6 +216,10 @@ describe("Pi runtime helpers", () => {
         "provider server error (HTTP 502)",
       ],
       [`HTTP 400: bad request ${secret}`, "request rejected (HTTP 400)"],
+      [
+        `Codex error: {"type":"error","status":400,"message":"${secret}"}`,
+        "request rejected (HTTP 400)",
+      ],
       [`fetch failed: ${secret}`, "network or transport error"],
       [
         `unexpected response: ${secret}`,
@@ -190,7 +233,10 @@ describe("Pi runtime helpers", () => {
         () => undefined,
         (error: unknown) => error,
       );
-      expect(failure).toBeInstanceOf(Error);
+      expect(failure).toBeInstanceOf(AuditSessionError);
+      expect((failure as AuditSessionError).retryable).toBe(
+        !category.startsWith("authentication"),
+      );
       expect((failure as Error).message).toContain(category);
       expect((failure as Error).message).not.toContain(secret);
       expect((failure as Error).message).not.toContain(raw);
@@ -205,9 +251,13 @@ describe("Pi runtime helpers", () => {
     });
     registration.setResponses([fauxAssistantMessage('{"findings":[]}')]);
     const runtime = new PiAuditRuntime({ resolve: async () => snapshot });
-    await expect(
-      runtime.run({ ...input, limits: { ...input.limits, timeoutMs: 1 } }),
-    ).rejects.toThrow("timed out after 1 ms");
+    const failure = await runtime
+      .run({ ...input, limits: { ...input.limits, timeoutMs: 1 } })
+      .catch((error: unknown) => error);
+    expect((failure as AuditSessionError).message).toContain(
+      "timed out after 1 ms",
+    );
+    expect((failure as AuditSessionError).retryable).toBe(false);
   });
 
   test("fails closed for non-read-only permissions and missing provider output", async () => {
@@ -216,5 +266,11 @@ describe("Pi runtime helpers", () => {
       runtime.run({ ...input, permissions: "write" as never }),
     ).rejects.toThrow("read-only");
     await expect(runtime.run(input)).rejects.toThrow();
+    registration = registerFauxProvider({
+      api: "openai-responses",
+      provider: "openai",
+    });
+    registration.setResponses([fauxAssistantMessage("x".repeat(2_000))]);
+    await expect(runtime.run(input)).rejects.toThrow("output limit");
   });
 });

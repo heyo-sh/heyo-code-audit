@@ -15,7 +15,10 @@ import {
   GitHubReviewProgress,
 } from "@heyo-sh/code-audit-reporter-github";
 import {
+  createLangfuseTracer,
+  NO_TRACER,
   PiAuditRuntime,
+  type AuditTracer,
   type SnapshotResolver,
 } from "@heyo-sh/code-audit-runtime-pi";
 
@@ -32,7 +35,7 @@ interface ActionCore {
   setFailed(message: string): void;
 }
 
-interface AuditRunner {
+export interface AuditRunner {
   run(config: AuditConfig): Promise<RunOutcome>;
 }
 
@@ -98,11 +101,16 @@ export async function runAction(
     verification: dependencies.core.getInput("verification"),
     report: dependencies.core.getInput("report"),
     "comment-on-clean": dependencies.core.getInput("comment-on-clean"),
+    "summary-comment": dependencies.core.getInput("summary-comment"),
     "fail-on": dependencies.core.getInput("fail-on"),
     paths: dependencies.core.getInput("paths"),
     incremental: dependencies.core.getInput("incremental"),
     "max-pr-commits": dependencies.core.getInput("max-pr-commits"),
     "max-new-commits": dependencies.core.getInput("max-new-commits"),
+    "langfuse-public-key": dependencies.core.getInput("langfuse-public-key"),
+    "langfuse-secret-key": dependencies.core.getInput("langfuse-secret-key"),
+    "langfuse-base-url": dependencies.core.getInput("langfuse-base-url"),
+    "langfuse-environment": dependencies.core.getInput("langfuse-environment"),
   });
   const context = {
     owner,
@@ -163,7 +171,8 @@ export function createGitHubReviewProgress(
 export function createAuditService(
   config: AuditConfig,
   context: AuditContext,
-): AuditService {
+  tracer: AuditTracer = createTracer(config, context),
+): AuditRunner {
   const client = createGitHubClient(config.githubToken);
   const repository = new GitHubAuditRepository(client, {
     owner: context.owner,
@@ -171,27 +180,79 @@ export function createAuditService(
     prNumber: context.prNumber,
     repositoryPath: context.workspace ?? process.cwd(),
   });
-  return new AuditService({
+  const service = new AuditService({
     repository,
     runtime: new PiAuditRuntime(
       createSnapshotResolver(repository, config.paths, context.workspace),
+      tracer,
     ),
     publisher: new GitHubAuditPublisher(client, config),
   });
+  return withTraceFlush(service, tracer);
 }
 
+/** Sends the traces of a run before the Action process ends, whatever the outcome. */
+export function withTraceFlush(
+  audit: AuditRunner,
+  tracer: AuditTracer,
+): AuditRunner {
+  return {
+    async run(config) {
+      try {
+        return await audit.run(config);
+      } finally {
+        await tracer.flush();
+      }
+    },
+  };
+}
+
+/** Langfuse tracing when both Langfuse keys are configured. */
+export function createTracer(
+  config: AuditConfig,
+  context: AuditContext,
+): AuditTracer {
+  if (!config.langfuse) return NO_TRACER;
+  return createLangfuseTracer(
+    config.langfuse,
+    {
+      repository: `${context.owner}/${context.repo}`,
+      pullRequest: context.prNumber,
+    },
+    {
+      secrets: [
+        config.githubToken,
+        "token" in config.auth ? config.auth.token : undefined,
+      ],
+    },
+  );
+}
+
+/**
+ * Resolves the snapshot behind the Pi tools. Every session of one range shares
+ * one snapshot, so parallel sessions do not recompute the same git diff.
+ */
 export function createSnapshotResolver(
   repository: AuditRepository,
   paths: string[],
   workspace: string | undefined,
 ): SnapshotResolver {
+  const snapshots = new Map<string, ReturnType<SnapshotResolver["resolve"]>>();
   return {
     async resolve(repositoryPath, baseSha, headSha) {
       if (workspace && repositoryPath !== workspace)
         throw new Error(
           "Pi runtime repository path did not match the checked-out workspace.",
         );
-      return repository.getSnapshot(baseSha, headSha, paths);
+      const key = `${baseSha}..${headSha}`;
+      let snapshot = snapshots.get(key);
+      if (!snapshot) {
+        snapshot = repository.getSnapshot(baseSha, headSha, paths);
+        snapshots.set(key, snapshot);
+        // A failed resolution is not cached, so a retry can succeed.
+        snapshot.catch(() => snapshots.delete(key));
+      }
+      return snapshot;
     },
   };
 }
@@ -233,6 +294,7 @@ function safeErrorDetail(error: unknown, config: AuditConfig): string {
   const configuredSecrets = [
     config.githubToken,
     "token" in config.auth ? config.auth.token : undefined,
+    config.langfuse?.secretKey,
   ];
   for (const secret of configuredSecrets) {
     if (secret) detail = detail.replaceAll(secret, "[REDACTED_SECRET]");

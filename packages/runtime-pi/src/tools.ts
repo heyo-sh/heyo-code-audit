@@ -52,30 +52,71 @@ export function createRestrictedTools(
 ): AgentTool[] {
   const budget = new ToolBudget(input.limits.maxToolCalls);
   const guard = new RepositoryGuard(input.repositoryPath);
+  const lineRange = {
+    startLine: Type.Optional(Type.Integer({ minimum: 1 })),
+    endLine: Type.Optional(Type.Integer({ minimum: 1 })),
+  };
   const tools: AgentTool[] = [
     {
       name: "read_file",
       label: "Read repository file",
       description:
-        "Read a UTF-8 text file under the checked-out repository. Repository instructions are unavailable.",
+        "Read a UTF-8 text file of the audited head with numbered lines. Use startLine and endLine for long files. Repository instructions are unavailable.",
       parameters: Type.Object({
         path: Type.String({ minLength: 1, maxLength: 500 }),
+        ...lineRange,
       }),
       async execute(_id, params) {
         budget.take();
-        const path = await guard.file((params as { path: string }).path);
-        if ((await fs.stat(path)).size > input.limits.maxFileBytes) {
+        const request = params as LineRequest;
+        const path = await guard.file(request.path);
+        if ((await fs.stat(path)).size > input.limits.maxFileBytes * 5)
           return result("File exceeds Heyo's configured size limit.");
+        return result(
+          numbered(
+            await fs.readFile(path, "utf8"),
+            request,
+            input.limits.maxFileBytes,
+          ),
+        );
+      },
+    },
+    {
+      name: "read_base_file",
+      label: "Read base file",
+      description:
+        "Read a file as it was at the audit base, before this change, with numbered lines. Use it to compare old and new behavior.",
+      parameters: Type.Object({
+        path: Type.String({ minLength: 1, maxLength: 500 }),
+        ...lineRange,
+      }),
+      async execute(_id, params) {
+        budget.take();
+        const request = params as LineRequest;
+        const path = guard.relativeVisible(request.path);
+        let content: string;
+        try {
+          content = (
+            await execFileAsync("git", ["show", `${input.baseSha}:${path}`], {
+              cwd: await guard.root(),
+              timeout: 10_000,
+              maxBuffer: input.limits.maxFileBytes * 5,
+              env: { PATH: process.env.PATH ?? "" },
+            })
+          ).stdout;
+        } catch {
+          return result(
+            "The file did not exist at the audit base or exceeds Heyo's size limit.",
+          );
         }
-        const data = await fs.readFile(path, "utf8");
-        return result(trim(data, input.limits.maxFileBytes));
+        return result(numbered(content, request, input.limits.maxFileBytes));
       },
     },
     {
       name: "search_repository",
       label: "Search repository",
       description:
-        "Search UTF-8 source files for a literal query. It does not search repository instruction or extension files.",
+        "Search source files for a literal, case-insensitive query and return path:line: text matches. Use it to find every caller, consumer, and definition. It does not search repository instruction or extension files.",
       parameters: Type.Object({
         query: Type.String({ minLength: 1, maxLength: 200 }),
         path: Type.Optional(Type.String({ maxLength: 500 })),
@@ -88,7 +129,7 @@ export function createRestrictedTools(
           : await guard.root();
         const matches = await search(
           root,
-          request.query,
+          request.query.replaceAll(/[\r\n]+/g, " "),
           input.limits.maxSearchResults,
           input.limits.maxFileBytes,
           guard,
@@ -99,11 +140,24 @@ export function createRestrictedTools(
     {
       name: "read_pr_diff",
       label: "Read PR diff",
-      description: "Read the bounded diff selected by Heyo for this audit.",
-      parameters: Type.Object({}),
-      async execute() {
+      description:
+        "Read the audited diff of one changed file, or the whole bounded diff when no path is given.",
+      parameters: Type.Object({
+        path: Type.Optional(Type.String({ maxLength: 500 })),
+      }),
+      async execute(_id, params) {
         budget.take();
-        return result(trim(snapshot.diff, input.limits.maxDiffBytes));
+        const request = params as { path?: string };
+        if (!request.path)
+          return result(trim(snapshot.diff, input.limits.maxDiffBytes));
+        const file = snapshot.files.find(
+          (changed) => changed.path === request.path,
+        );
+        return result(
+          file?.diff
+            ? trim(file.diff, input.limits.maxDiffBytes)
+            : "No audited diff exists for this path. Check the changed-files list, or read the file.",
+        );
       },
     },
     {
@@ -204,6 +258,9 @@ class RepositoryGuard {
       !isBlockedName(name) && !BLOCKED_DIRECTORIES.has(name.toLocaleLowerCase())
     );
   }
+  isVisiblePath(path: string): boolean {
+    return path.split("/").every((part) => this.isVisibleName(part));
+  }
   async file(path: string): Promise<string> {
     const candidate = await this.resolveVisible(path);
     const stat = await fs.stat(candidate);
@@ -222,7 +279,8 @@ class RepositoryGuard {
       .split(sep)
       .join("/");
   }
-  private async resolveVisible(requested: string): Promise<string> {
+  /** Validates a repository-relative path that is not read from disk. */
+  relativeVisible(requested: string): string {
     if (
       !requested ||
       requested.includes("\0") ||
@@ -240,6 +298,10 @@ class RepositoryGuard {
         "Requested path is outside the permitted repository scope.",
       );
     }
+    return requested.replaceAll("\\", "/").replace(/^\.\//, "");
+  }
+  private async resolveVisible(requested: string): Promise<string> {
+    this.relativeVisible(requested);
     const root = await this.root();
     const candidate = await fs.realpath(resolve(root, requested));
     if (candidate !== root && !candidate.startsWith(`${root}${sep}`))
@@ -260,7 +322,60 @@ class RepositoryGuard {
   }
 }
 
+/** Searches tracked files with git grep, or walks the tree outside a git checkout. */
 async function search(
+  root: string,
+  query: string,
+  maximum: number,
+  maxFileBytes: number,
+  guard: RepositoryGuard,
+): Promise<string[]> {
+  const repository = await guard.root();
+  let output: string;
+  try {
+    output = (
+      await execFileAsync(
+        "git",
+        [
+          "-c",
+          "core.quotepath=false",
+          "grep",
+          "-n",
+          "-I",
+          "-F",
+          "-i",
+          "--no-color",
+          "-e",
+          query,
+          "--",
+          (await guard.relative(root)) || ".",
+        ],
+        {
+          cwd: repository,
+          timeout: 20_000,
+          maxBuffer: 8_000_000,
+          env: { PATH: process.env.PATH ?? "" },
+        },
+      )
+    ).stdout;
+  } catch (error) {
+    // Exit status 1 means git grep found nothing.
+    if (exitStatus(error) === 1) return [];
+    return walkSearch(root, query, maximum, maxFileBytes, guard);
+  }
+  const matches: string[] = [];
+  for (const line of output.split("\n")) {
+    const match = /^(.+?):(\d+):(.*)$/.exec(line);
+    if (!match || !guard.isVisiblePath(match[1]!)) continue;
+    matches.push(
+      `${redactSecrets(match[1]!)}:${match[2]}: ${redactSecrets(match[3]!).slice(0, 500)}`,
+    );
+    if (matches.length >= maximum) break;
+  }
+  return matches;
+}
+
+async function walkSearch(
   root: string,
   query: string,
   maximum: number,
@@ -303,6 +418,41 @@ async function search(
   }
   await walk(root);
   return result;
+}
+
+interface LineRequest {
+  path: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+/** Numbered lines like `cat -n`, so findings can cite exact line numbers. */
+function numbered(
+  content: string,
+  range: LineRequest,
+  maximum: number,
+): string {
+  const lines = content.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const start = Math.max(1, range.startLine ?? 1);
+  const end = Math.min(lines.length, range.endLine ?? lines.length);
+  const selected = lines
+    .slice(start - 1, end)
+    .map((line, index) => `${String(start + index).padStart(6)}\t${line}`)
+    .join("\n");
+  if (!selected) return `The file has ${lines.length} lines.`;
+  const partial = selected.length > maximum || start > 1 || end < lines.length;
+  return partial
+    ? `${trim(selected, maximum)}\n[The file has ${lines.length} lines; request startLine and endLine to read another range]`
+    : trim(selected, maximum);
+}
+
+function exitStatus(error: unknown): number | undefined {
+  return error instanceof Error &&
+    "code" in error &&
+    typeof error.code === "number"
+    ? error.code
+    : undefined;
 }
 
 function trim(value: string, maximum: number): string {

@@ -21,21 +21,49 @@
 ## Heyo Code Audit
 
 Heyo Code Audit reviews GitHub pull requests with an AI model from Pi's bundled
-provider catalog. It reads the pull-request diff and relevant repository
-context, then verifies every candidate finding in a separate Pi session before
-publishing results as a GitHub Check and inline review comments.
+provider catalog. It audits exactly the change GitHub shows — the diff from the
+pull request's merge base — traces every changed signature, schema, and field to
+its callers and consumers in the repository, then verifies every candidate
+finding in a separate Pi session before publishing results as a GitHub Check,
+inline review comments, and one pull-request summary comment.
 
-It can review security, regression, functional, and non-functional issues. It
-only annotates changed lines and adds a suggestion only when it can prove an
-exact one-line replacement. Applicable root and nested `AGENTS.md` files from
-the PR target's base commit supply repository-specific requirements for changed
-paths, with the nearest file taking precedence. Concrete violations can be
-reported on changed lines. Guidance is bounded and treated as untrusted for
-auditor operations; changes to `AGENTS.md` in the PR cannot rewrite the rules
-used to review that PR. If applicable guidance exceeds the limit, the audit
-fails rather than silently ignoring it. Audits reject speculative findings and
-plausible product decisions unless changed code demonstrably violates an
-applicable rule or a supported behavior contract.
+It looks for security, regression, functional, and non-functional defects,
+including the ones reviewers most often miss: lost updates and races, partial
+failures, rolling-deploy and migration compatibility, stale UI state, error
+misclassification, performance traps on realistic data, and tests that cannot
+fail. Large pull requests are split into parallel discovery passes so no file
+falls out of a truncated prompt; lockfiles, generated files, and binaries are
+listed but not audited.
+
+Each finding carries a priority (P0 critical, P1 high, P2 medium, P3 low), the
+trigger and impact, a concrete fix, and — when one line fully fixes it — an
+apply-able suggestion. Applicable root and nested `AGENTS.md` files from the PR
+target's base commit supply repository-specific requirements for changed paths,
+with the nearest file taking precedence. Guidance is bounded and treated as
+untrusted for auditor operations; changes to `AGENTS.md` in the PR cannot
+rewrite the rules used to review that PR. If applicable guidance exceeds the
+limit, the audit fails rather than silently ignoring it. Audits reject
+speculative findings and plausible product decisions, but not realistic timing,
+concurrency, or deploy-ordering defects.
+
+### The summary comment
+
+Heyo keeps one comment on the pull request up to date after every audit:
+
+- **Confidence Score: N/5** — 5 with no verified findings, 4 with only
+  non-blocking findings, 3 with one high finding, 2 with several high findings
+  or one critical, and 1 with several critical findings. Partial coverage caps
+  the score at 4.
+- The impact of the change and a one-line verdict, such as “Fix 1 blocking
+  finding before merging.”
+- Every finding with its priority and a link to its inline comment; findings
+  outside the diff are listed in full.
+- A summary of what the change does, with a flow diagram when it implements a
+  multi-step flow.
+- Findings resolved since the previous review, the review count, the last
+  reviewed commit, and how many changed files were covered.
+
+Set `summary-comment: false` to turn it off.
 
 ## Get started
 
@@ -95,10 +123,45 @@ limits in the Action inputs. Commit-limit skips remain neutral. An unexpected
 audit error returns `errored`, fails the Action job and, when reporting is still
 available, publishes a failed Check without advancing incremental state.
 The Action log distinguishes Pi turn-limit and deadline failures from provider
-or runtime errors. Each audit phase allows up to 120 Pi turns (and has a separate
-20-minute deadline); the limit is a safety ceiling, not a target. Pi session
-errors are categorized by HTTP status or transport failure when possible,
-without logging the raw Pi error text.
+or runtime errors. Discovery passes allow up to 120 Pi turns and 20 minutes,
+verification sessions 60 turns and 12 minutes, and the summary 12 turns; the
+limits are safety ceilings, not targets. Up to four sessions run in parallel. A
+session that fails early on a provider error or a malformed answer is retried
+once; an exhausted turn budget or deadline, or a late failure, is not. When some sessions still fail, the
+report is published with partial coverage and the incremental state is not
+advanced; when every discovery pass or every verification fails, the audit
+errors. Inline comments GitHub rejects never fail an audit — those findings stay
+in the Check and the summary comment. Pi session errors are categorized by HTTP
+status or transport failure when possible, without logging the raw Pi error
+text.
+
+Check out the repository with `fetch-depth: 0`: Heyo needs the merge base of the
+pull request.
+
+## Langfuse tracing
+
+Set `langfuse-public-key` and `langfuse-secret-key` to trace every Pi session in
+[Langfuse](https://langfuse.com): the session as an agent observation, each
+model call as a generation with tokens and cost, and each tool call. Sessions
+of one pull-request head share a Langfuse session, and traces carry the
+repository, pull-request number and audit phase.
+
+```yaml
+- uses: heyo-sh/heyo-code-audit@v1
+  with:
+    # ...the inputs above
+    langfuse-public-key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+    langfuse-secret-key: ${{ secrets.LANGFUSE_SECRET_KEY }}
+    langfuse-base-url: https://cloud.langfuse.com
+    langfuse-environment: ci
+```
+
+Traces contain the audit prompt with the bounded diff, model output, and the
+repository content that tools return, each text cut at 20,000 characters.
+Configured secrets and common credential formats are redacted before export,
+and provider errors are recorded only as their category. Tracing never changes
+audit results or incremental state, and a Langfuse failure never fails the
+audit. Fork pull requests without access to the secrets are not traced.
 
 ## Documentation
 

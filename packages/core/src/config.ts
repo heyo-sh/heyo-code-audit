@@ -5,6 +5,7 @@ import {
   type AuditConfig,
   type CheckId,
   type CommitLimit,
+  type LangfuseConfig,
   type ProviderId,
   type ReportMode,
   type Severity,
@@ -22,6 +23,9 @@ const OAUTH_AUTH_TYPES = ["oauth"] as const;
 const BEDROCK_AUTH_TYPES = ["aws", "bedrock-bearer"] as const;
 const OAUTH_PROVIDERS = new Set(["github-copilot", "openai-codex"]);
 const BEDROCK_PROVIDER = "amazon-bedrock";
+const DEFAULT_LANGFUSE_BASE_URL = "https://cloud.langfuse.com";
+// Langfuse's own environment rule: lowercase, at most 40 characters, not starting with "langfuse".
+const LANGFUSE_ENVIRONMENT = /^(?!langfuse)[a-z0-9_-]{1,40}$/;
 const AUTH_TYPES = new Set<AuditAuth["type"]>([
   "api-key",
   "oauth",
@@ -48,15 +52,26 @@ export function parseAuditConfig(
       false,
       "comment-on-clean",
     ),
+    summaryComment: parseBoolean(
+      inputs["summary-comment"],
+      true,
+      "summary-comment",
+    ),
     failOn: parseFailOn(inputs["fail-on"]),
     paths: parsePaths(inputs.paths),
     incremental: parseBoolean(inputs.incremental, true, "incremental"),
     maxPrCommits: parseLimit(inputs["max-pr-commits"], 100, "max-pr-commits"),
     maxNewCommits: parseLimit(inputs["max-new-commits"], 20, "max-new-commits"),
   };
-  return config;
+  const langfuse = parseLangfuse(inputs);
+  return langfuse ? { ...config, langfuse } : config;
 }
 
+/**
+ * Identifies the configuration an incremental state was produced under. Inputs
+ * that change only presentation or tracing, such as the summary comment and
+ * Langfuse, are excluded so changing them never forces a full audit.
+ */
 export function configHash(config: AuditConfig): string {
   const visible = {
     provider: config.provider,
@@ -223,6 +238,46 @@ function parseLimit(
   throw new ConfigError(
     `Input '${name}' must be a positive integer or 'unlimited'.`,
   );
+}
+
+function parseLangfuse(
+  inputs: Record<string, string | undefined>,
+): LangfuseConfig | undefined {
+  const publicKey = inputs["langfuse-public-key"]?.trim();
+  const secretKey = inputs["langfuse-secret-key"]?.trim();
+  if (!publicKey && !secretKey) return undefined;
+  if (!publicKey || !secretKey)
+    throw new ConfigError(
+      "Inputs 'langfuse-public-key' and 'langfuse-secret-key' must be set together.",
+    );
+  const environment = inputs["langfuse-environment"]?.trim();
+  if (environment && !LANGFUSE_ENVIRONMENT.test(environment))
+    throw new ConfigError(
+      "Input 'langfuse-environment' must be at most 40 lowercase letters, numbers, hyphens, or underscores and must not start with 'langfuse'.",
+    );
+  return {
+    publicKey,
+    secretKey,
+    baseUrl: parseLangfuseBaseUrl(inputs["langfuse-base-url"]),
+    ...(environment ? { environment } : {}),
+  };
+}
+
+function parseLangfuseBaseUrl(value: string | undefined): string {
+  const baseUrl = value?.trim() || DEFAULT_LANGFUSE_BASE_URL;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new ConfigError(
+      "Input 'langfuse-base-url' must be an http or https URL.",
+    );
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:")
+    throw new ConfigError(
+      "Input 'langfuse-base-url' must be an http or https URL.",
+    );
+  return baseUrl.replace(/\/+$/, "");
 }
 
 function parseList(value: string | undefined): string[] {
