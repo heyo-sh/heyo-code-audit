@@ -775,10 +775,20 @@ export function splitDiff(diff: string): Map<string, string> {
       /^\+\+\+ b\/(.+)$/m.exec(part)?.[1] ??
       /^rename to (.+)$/m.exec(part)?.[1] ??
       /^--- a\/(.+)$/m.exec(part)?.[1] ??
-      /^diff --git a\/.+ b\/(.+)$/m.exec(part)?.[1];
+      headerPath(part);
     if (path) chunks.set(path, part.replace(/\n$/, ""));
   }
   return chunks;
+}
+
+/** The head path of a `diff --git a/<old> b/<new>` header, without backtracking. */
+function headerPath(part: string): string | undefined {
+  const newline = part.indexOf("\n");
+  const header = newline < 0 ? part : part.slice(0, newline);
+  const separator = header.lastIndexOf(" b/");
+  return separator > "diff --git a/".length
+    ? header.slice(separator + " b/".length) || undefined
+    : undefined;
 }
 
 function changedFile(

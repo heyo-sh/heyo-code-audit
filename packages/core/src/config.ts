@@ -277,7 +277,9 @@ function parseLangfuseBaseUrl(value: string | undefined): string {
     throw new ConfigError(
       "Input 'langfuse-base-url' must be an http or https URL.",
     );
-  return baseUrl.replace(/\/+$/, "");
+  let end = baseUrl.length;
+  while (end > 0 && baseUrl[end - 1] === "/") end -= 1;
+  return baseUrl.slice(0, end);
 }
 
 function parseList(value: string | undefined): string[] {

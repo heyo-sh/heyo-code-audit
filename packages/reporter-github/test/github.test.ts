@@ -910,6 +910,10 @@ describe("GitHub adapter", () => {
       "logo.png",
     ]);
     expect(chunks.get("a.ts")).toBe("diff --git a/a.ts b/a.ts\n+++ b/a.ts");
+    expect([...splitDiff("diff --git a/x y.ts b/x y.ts").keys()]).toEqual([
+      "x y.ts",
+    ]);
+    expect([...splitDiff("diff --git a/x b/").keys()]).toEqual([]);
   });
 
   test("publishes a clean PR review and supports review-only reporting", async () => {
