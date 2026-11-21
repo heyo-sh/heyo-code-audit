@@ -6,7 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "bun run --filter '*' build && bun run bundle:action",
+    "build": "bun run --filter @heyo-sh/code-audit-core build && bun run --filter @heyo-sh/code-audit-runtime-pi build && bun run --filter @heyo-sh/code-audit-reporter-github build && bun run --filter @heyo-sh/heyo-code-audit build && bun run bundle:action",
     "bundle:action": "bun build packages/cli/src/main.ts --outfile dist/action.js --target node --format cjs --minify",
     "typecheck": "bun run --filter @heyo-sh/code-audit-core build && bun run --filter @heyo-sh/code-audit-core typecheck && bun run --filter @heyo-sh/code-audit-runtime-pi build && bun run --filter @heyo-sh/code-audit-runtime-pi typecheck && bun run --filter @heyo-sh/code-audit-reporter-github build && bun run --filter @heyo-sh/code-audit-reporter-github typecheck && bun run --filter @heyo-sh/heyo-code-audit build && bun run --filter @heyo-sh/heyo-code-audit typecheck",
     "test": "bun test",
